@@ -17,6 +17,7 @@ package com.google.firebase.firestore.core;
 import static com.google.firebase.firestore.util.Assert.fail;
 import static com.google.firebase.firestore.util.Assert.hardAssert;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 import com.google.android.gms.tasks.Task;
@@ -48,11 +49,13 @@ import com.google.firebase.firestore.util.Function;
 import com.google.firebase.firestore.util.Logger;
 import com.google.firebase.firestore.util.Util;
 import io.grpc.Status;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 
 /**
@@ -89,7 +92,27 @@ public class SyncEngine implements RemoteStore.RemoteStoreCallback {
     }
   }
 
+  /** An entry in {@link #limboListenQueue}. */
+  private static final class LimboListenQueueEntry {
+
+    final DocumentKey key;
+    final TargetData targetData;
+
+    LimboListenQueueEntry(DocumentKey key, TargetData targetData) {
+      this.key = key;
+      this.targetData = targetData;
+    }
+
+    @NonNull
+    @Override
+    public String toString() {
+      return "key=" + key + " targetData=" + targetData;
+    }
+  }
+
   private static final String TAG = SyncEngine.class.getSimpleName();
+
+  private static final int DEFAULT_MAX_CONCURRENT_LIMBO_RESOLUTIONS = 100;
 
   /** Interface implemented by EventManager to handle notifications from SyncEngine. */
   interface SyncEngineCallback {
@@ -109,6 +132,9 @@ public class SyncEngine implements RemoteStore.RemoteStoreCallback {
   /** The remote store for sending writes, watches, etc. to the backend. */
   private final RemoteStore remoteStore;
 
+  /** The max number of concurrent listens for limbo resolution; see {@link #limboListenQueue}. */
+  private final int maxConcurrentLimboResolutions;
+
   /** QueryViews for all active queries, indexed by query. */
   private final Map<Query, QueryView> queryViewsByQuery;
 
@@ -127,6 +153,13 @@ public class SyncEngine implements RemoteStore.RemoteStoreCallback {
    */
   private final Map<Integer, LimboResolution> limboResolutionsByTarget;
 
+  /**
+   * The list of enqueued limbo resolutions. After {@link #maxConcurrentLimboResolutions} listens
+   * have started for the purpose of limbo resolutions then additional limbo resolution listens are
+   * enqueued in this queue. When a listen completes then a listen is dequeued and started.
+   */
+  private final Queue<LimboListenQueueEntry> limboListenQueue;
+
   /** Used to track any documents that are currently in limbo. */
   private final ReferenceSet limboDocumentRefs;
 
@@ -144,14 +177,24 @@ public class SyncEngine implements RemoteStore.RemoteStoreCallback {
   private SyncEngineCallback syncEngineListener;
 
   public SyncEngine(LocalStore localStore, RemoteStore remoteStore, User initialUser) {
+    this(localStore, remoteStore, initialUser, DEFAULT_MAX_CONCURRENT_LIMBO_RESOLUTIONS);
+  }
+
+  public SyncEngine(
+      LocalStore localStore,
+      RemoteStore remoteStore,
+      User initialUser,
+      int maxConcurrentLimboResolutions) {
     this.localStore = localStore;
     this.remoteStore = remoteStore;
+    this.maxConcurrentLimboResolutions = maxConcurrentLimboResolutions;
 
     queryViewsByQuery = new HashMap<>();
     queriesByTarget = new HashMap<>();
 
     limboTargetsByKey = new HashMap<>();
     limboResolutionsByTarget = new HashMap<>();
+    limboListenQueue = new ArrayDeque<>();
     limboDocumentRefs = new ReferenceSet();
 
     mutationUserCallbacks = new HashMap<>();
@@ -380,6 +423,10 @@ public class SyncEngine implements RemoteStore.RemoteStoreCallback {
       limboTargetsByKey.remove(limboKey);
       limboResolutionsByTarget.remove(targetId);
 
+      if (!limboListenQueue.isEmpty()) {
+        remoteStore.listen(limboListenQueue.remove().targetData);
+      }
+
       // TODO: Retry on transient errors?
 
       // It's a limbo doc. Create a synthetic event saying it was deleted. This is kind of a hack.
@@ -540,6 +587,9 @@ public class SyncEngine implements RemoteStore.RemoteStoreCallback {
       remoteStore.stopListening(targetId);
       limboTargetsByKey.remove(key);
       limboResolutionsByTarget.remove(targetId);
+      if (!limboListenQueue.isEmpty()) {
+        remoteStore.listen(limboListenQueue.remove().targetData);
+      }
     }
   }
 
@@ -616,7 +666,11 @@ public class SyncEngine implements RemoteStore.RemoteStoreCallback {
               ListenSequence.INVALID,
               QueryPurpose.LIMBO_RESOLUTION);
       limboResolutionsByTarget.put(limboTargetId, new LimboResolution(key));
-      remoteStore.listen(targetData);
+      if (limboResolutionsByTarget.size() <= maxConcurrentLimboResolutions) {
+        remoteStore.listen(targetData);
+      } else {
+        limboListenQueue.add(new LimboListenQueueEntry(key, targetData));
+      }
       limboTargetsByKey.put(key, limboTargetId);
     }
   }
@@ -625,6 +679,15 @@ public class SyncEngine implements RemoteStore.RemoteStoreCallback {
   public Map<DocumentKey, Integer> getCurrentLimboDocuments() {
     // Make a defensive copy as the Map continues to be modified.
     return new HashMap<>(limboTargetsByKey);
+  }
+
+  @VisibleForTesting
+  public List<DocumentKey> getEnqueuedLimboDocuments() {
+    ArrayList<DocumentKey> list = new ArrayList<>(limboListenQueue.size());
+    for (LimboListenQueueEntry entry : limboListenQueue) {
+      list.add(entry.key);
+    }
+    return list;
   }
 
   public void handleCredentialChange(User user) {

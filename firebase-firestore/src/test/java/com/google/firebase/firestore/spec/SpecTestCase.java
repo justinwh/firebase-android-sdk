@@ -153,6 +153,7 @@ public abstract class SpecTestCase implements RemoteStoreCallback {
           : Sets.newHashSet("no-android", BENCHMARK_TAG, "multi-client");
 
   private boolean garbageCollectionEnabled;
+  private Integer maxNumConcurrentLimboResolutions;
   private boolean networkEnabled = true;
 
   //
@@ -250,6 +251,8 @@ public abstract class SpecTestCase implements RemoteStoreCallback {
     outstandingWrites = new HashMap<>();
 
     this.garbageCollectionEnabled = config.optBoolean("useGarbageCollection", false);
+    this.maxNumConcurrentLimboResolutions =
+        (Integer) config.opt("maxNumConcurrentLimboResolutions");
 
     currentUser = User.UNAUTHENTICATED;
 
@@ -293,7 +296,12 @@ public abstract class SpecTestCase implements RemoteStoreCallback {
     ConnectivityMonitor connectivityMonitor =
         new AndroidConnectivityMonitor(ApplicationProvider.getApplicationContext());
     remoteStore = new RemoteStore(this, localStore, datastore, queue, connectivityMonitor);
-    syncEngine = new SyncEngine(localStore, remoteStore, currentUser);
+    if (maxNumConcurrentLimboResolutions == null) {
+      syncEngine = new SyncEngine(localStore, remoteStore, currentUser);
+    } else {
+      syncEngine =
+          new SyncEngine(localStore, remoteStore, currentUser, maxNumConcurrentLimboResolutions);
+    }
     eventManager = new EventManager(syncEngine);
     localStore.start();
     remoteStore.start();
@@ -988,12 +996,20 @@ public abstract class SpecTestCase implements RemoteStoreCallback {
     @SuppressWarnings("VisibleForTests")
     Map<DocumentKey, Integer> actualLimboDocs =
         new HashMap<>(syncEngine.getCurrentLimboDocuments());
+    @SuppressWarnings("VisibleForTests")
+    List<DocumentKey> enqueuedLimboDocuments = syncEngine.getEnqueuedLimboDocuments();
 
     // Validate that each limbo doc has an expected active target
     for (Map.Entry<DocumentKey, Integer> limboDoc : actualLimboDocs.entrySet()) {
-      assertTrue(
-          "Found limbo doc " + limboDoc.getKey() + " without an expected active target",
-          expectedActiveTargets.containsKey(limboDoc.getValue()));
+      if (enqueuedLimboDocuments.contains(limboDoc.getKey())) {
+        assertFalse(
+            "Found limbo doc " + limboDoc.getKey() + " with an unexpected active target",
+            expectedActiveTargets.containsKey(limboDoc.getValue()));
+      } else {
+        assertTrue(
+            "Found limbo doc " + limboDoc.getKey() + " without an expected active target",
+            expectedActiveTargets.containsKey(limboDoc.getValue()));
+      }
     }
 
     for (DocumentKey expectedLimboDoc : expectedLimboDocs) {
